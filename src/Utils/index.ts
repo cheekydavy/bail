@@ -16,4 +16,7 @@ export * from './link-preview'
 export * from './event-buffer'
 export * from './process-message'
 export * from './message-retry-manager'
-export * from './offline-node-processor'
+// MessageType is intentionally excluded from this barrel re-export.
+// It conflicts with the MessageType already exported from ./messages (via Types).
+// messages-recv.ts imports it directly from '../Utils/offline-node-processor'.
+export { makeOfflineNodeProcessor, OfflineNodeProcessorDeps } from './offline-node-processor'
