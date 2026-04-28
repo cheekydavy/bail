@@ -1,6 +1,10 @@
 import { BinaryNode } from '../WABinary'
 
-export type MessageType = 'message' | 'call' | 'receipt' | 'notification'
+// MessageType is intentionally NOT exported here — the same name is already
+// exported from './messages' via Utils/index.ts. Exporting it again causes
+// TS2308 "already exported" error at build time.
+// This local alias is only used internally within this file.
+type MessageType = 'message' | 'call' | 'receipt' | 'notification'
 
 type OfflineNode = { type: MessageType; node: BinaryNode }
 
