@@ -41,6 +41,7 @@ import {
 	unixTimestampSeconds
 } from '../Utils'
 import { getUrlInfo } from '../Utils/link-preview'
+import { makeMutex } from '../Utils/make-mutex'
 import {
 	areJidsSameUser,
 	BinaryNode,
@@ -90,6 +91,34 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 	const messageRetryManager = (enableRecentMessageCache !== false)
 		? new MessageRetryManager(logger, maxMsgRetryCount)
 		: null
+
+	// ── THREE SEPARATE MUTEXES — THE CORE FIX FOR DUPLICATE RESPONSES ────────
+	//
+	// ROOT CAUSE of the double-response bug:
+	// The old code used a single shared `processingMutex` (from the socket
+	// layer) for ALL node types. With 4 WA sessions in one process, and WA
+	// multi-device delivering each message to every linked device, two
+	// deliveries of the same node could enter handleMessage() concurrently
+	// before the shared mutex serialised them.
+	//
+	// WHY SEPARATE MUTEXES FIX IT:
+	//   messageMutex      — serialises ALL incoming <message> nodes
+	//   notificationMutex — serialises ALL <notification> nodes independently
+	//   receiptMutex      — serialises ALL <receipt> nodes independently
+	//
+	// Each mutex is a simple promise-chain queue (see make-mutex.ts).
+	// The second delivery of the same message hits messageMutex, waits
+	// for the first to finish, sees the message already acked+upserted,
+	// and exits without triggering the command handler a second time.
+	//
+	// This is combined with the async/await fix in messages-recv.ts where
+	// ws.on('CB:message') handlers are now `async (node) => { await ... }`
+	// so the WebSocket event loop properly awaits each handler before
+	// processing the next frame from the same socket.
+	// ─────────────────────────────────────────────────────────────────────────
+	const messageMutex      = makeMutex()
+	const notificationMutex = makeMutex()
+	const receiptMutex      = makeMutex()
 
 	const userDevicesCache: CacheStore = (config.userDevicesCache || new NodeCache({
 		stdTTL: DEFAULT_CACHE_TTLS.USER_DEVICES, // 5 minutes
@@ -785,6 +814,13 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 	return {
 		...sock,
+		// ── Exported for messages-recv.ts — these are destructured there as:
+		//   const { messageMutex, notificationMutex, receiptMutex } = sock
+		// Without these exports they would be undefined, mutex() would throw,
+		// and ALL node processing would be unserialised → duplicate responses.
+		messageMutex,
+		notificationMutex,
+		receiptMutex,
 		getPrivacyTokens,
 		assertSessions,
 		relayMessage,
