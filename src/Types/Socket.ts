@@ -128,4 +128,12 @@ export type SocketConfig = {
     cachedGroupMetadata: (jid: string) => Promise<GroupMetadata | undefined>
 
     makeSignalRepository: (auth: SignalAuthState) => SignalRepository
+
+    /**
+     * Enable in-memory cache of recently sent messages for improved retry reliability.
+     * When getMessage() returns undefined (common on stateless/Heroku deployments),
+     * the cache is used as a fallback so the retry path can still resend the original message.
+     * Default: true
+     */
+    enableRecentMessageCache?: boolean
 }

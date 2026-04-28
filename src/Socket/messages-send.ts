@@ -35,6 +35,7 @@ import {
 	getStatusCodeForMediaRetry,
 	getUrlFromDirectPath,
 	getWAUploadToServer,
+	MessageRetryManager,
 	normalizeMessageContent,
 	parseAndInjectE2ESessions,
 	unixTimestampSeconds
@@ -66,6 +67,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		options: axiosOptions,
 		patchMessageBeforeSending,
 		cachedGroupMetadata,
+		maxMsgRetryCount,
+		enableRecentMessageCache,
 	} = config
 	const sock = makeNewsletterSocket(config)
 	const {
@@ -80,6 +83,13 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		groupMetadata,
 		groupToggleEphemeral,
 	} = sock
+
+	// ── messageRetryManager: caches recently sent messages so retries can
+	// resend them even when getMessage() returns undefined (stateless Heroku).
+	// Enabled by default; set enableRecentMessageCache: false to disable.
+	const messageRetryManager = (enableRecentMessageCache !== false)
+		? new MessageRetryManager(logger, maxMsgRetryCount)
+		: null
 
 	const userDevicesCache: CacheStore = (config.userDevicesCache || new NodeCache({
 		stdTTL: DEFAULT_CACHE_TTLS.USER_DEVICES, // 5 minutes
@@ -298,7 +308,6 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 	const sendPeerDataOperationMessage = async(
 		pdoMessage: proto.Message.IPeerDataOperationRequestMessage
 	): Promise<string> => {
-		//TODO: for later, abstract the logic to send a Peer Message instead of just PDO - useful for App State Key Resync with phone
 		if(!authState.creds.me?.id) {
 			throw new Boom('Not authenticated')
 		}
@@ -400,9 +409,6 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		const extraAttrs = {}
 
 		if(participant) {
-			// when the retry request is not for a group
-			// only send to the specific device that asked for a retry
-			// otherwise the message is sent out to every device that should be a recipient
 			if(!isGroup && !isStatus) {
 				additionalAttributes = { ...additionalAttributes, 'device_fanout': 'false' }
 			}
@@ -479,18 +485,14 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					)
 
 					const senderKeyJids: string[] = []
-					// ensure a connection is established with every device
 					for(const { user, device } of devices) {
 						const jid = jidEncode(user, groupData?.addressingMode === 'lid' ? 'lid' : 's.whatsapp.net', device)
 						if(!senderKeyMap[jid] || !!participant) {
 							senderKeyJids.push(jid)
-							// store that this person has had the sender keys sent to them
 							senderKeyMap[jid] = true
 						}
 					}
 
-					// if there are some participants with whom the session has not been established
-					// if there are, we re-send the senderkey
 					if(senderKeyJids.length) {
 						logger.debug({ senderKeyJids }, 'sending new sender key')
 
@@ -611,9 +613,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					},
 					content: binaryNodeContent
 				}
-				// if the participant to send to is explicitly specified (generally retry recp)
-				// ensure the message is only sent to that person
-				// if a retry receipt is sent to everyone -- it'll fail decryption for everyone else who received the msg
+
 				if(participant) {
 					if(isJidGroup(destinationJid)) {
 						stanza.attrs.to = destinationJid
@@ -665,7 +665,6 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 							}]
 						}]
 					} else if(message?.listMessage) {
-						// list message only support in private chat
 						bizNode.content = [{
 							tag: 'list',
 							attrs: {
@@ -681,6 +680,13 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				logger.debug({ msgId }, `sending message to ${participants.length} devices`)
 
 				await sendNode(stanza)
+
+				// ── Cache for retry: store every outgoing non-retry message so that
+				// sendMessagesAgain() can find it even when getMessage() returns undefined.
+				// Only cache original sends (not participant-targeted retries).
+				if(messageRetryManager && !participant && msgId && message) {
+					messageRetryManager.addRecentMessage(destinationJid, msgId, message)
+				}
 			}
 		)
 
@@ -791,6 +797,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		getUSyncDevices,
 		createParticipantNodes,
 		sendPeerDataOperationMessage,
+		messageRetryManager,
 		updateMediaMessage: async(message: proto.IWebMessageInfo) => {
 			const content = assertMediaContent(message.message)
 			const mediaKey = content.mediaKey!
@@ -993,24 +1000,18 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				const isAiMsg = 'ai' in content && !!content.ai
 				const additionalAttributes: BinaryNodeAttributes = { }
 				const additionalNodes: BinaryNode[] = []
-				// required for delete
 				if(isDeleteMsg) {
-					// if the chat is a group, and I am not the author, then delete the message as an admin
 					if((isJidGroup((content.delete as WAMessageKey).remoteJid!) && !(content.delete as WAMessageKey).fromMe) || isJidNewsletter(jid)) {
 						additionalAttributes.edit = '8'
 					} else {
 						additionalAttributes.edit = '7'
 					}
-				// required for edit message
 				} else if(isEditMsg) {
 					additionalAttributes.edit = isJidNewsletter(jid) ? '3' : '1'
-				// required for pin message
 				} else if(isPinMsg) {
 					additionalAttributes.edit = '2'
-				// required for keep message
 				} else if(isKeepMsg) {
 					additionalAttributes.edit = '6'
-				// required for polling message
 				} else if(isPollMessage) {
 					additionalNodes.push({
 						tag: 'meta',
@@ -1018,7 +1019,6 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 							polltype: 'creation'
 						},
 					} as BinaryNode)
-				// required to display AI icon on message
 				} else if(isAiMsg) {
 					additionalNodes.push({
 						attrs: {

@@ -35,7 +35,19 @@ export const makeChatsSocket = (config: SocketConfig) => {
 	let privacySettings: { [_: string]: string } | undefined
 	let needToFlushWithAppStateSync = false
 	let pendingAppStateSync = false
-	/** this mutex ensures that the notifications (receipts, messages etc.) are processed in order */
+
+	// ── THREE SEPARATE MUTEXES (mirrors friend's baileys fix) ──────────────
+	// Previously one processingMutex handled messages, receipts AND notifications.
+	// A slow message handler would block receipts (and vice versa), and because
+	// ws.on() callbacks were synchronous the second copy of the same multi-device
+	// delivery could sneak in before the mutex fired.  Using three independent
+	// mutexes means a slow app-state notification can never delay message acks,
+	// and each queue runs in strict FIFO order within its own type.
+	const messageMutex = makeMutex()
+	const receiptMutex = makeMutex()
+	const notificationMutex = makeMutex()
+	// appPatch still uses its own mutex; we alias it as processingMutex so the
+	// existing appPatch() body below compiles without change.
 	const processingMutex = makeMutex()
 
 	const placeholderResendCache: CacheStore = (config.placeholderResendCache || new NodeCache({
@@ -1003,6 +1015,12 @@ export const makeChatsSocket = (config: SocketConfig) => {
 	return {
 		...sock,
 		getBotListV2,
+		// expose all three mutexes — messages-recv.ts uses messageMutex,
+		// notificationMutex, and receiptMutex directly
+		messageMutex,
+		receiptMutex,
+		notificationMutex,
+		// keep processingMutex on the public API for backward compat
 		processingMutex,
 		fetchPrivacySettings,
 		upsertMessage,
